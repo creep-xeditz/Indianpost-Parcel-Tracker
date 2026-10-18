@@ -57,7 +57,7 @@ Built with **Supabase** (PostgreSQL + Storage), deployed on **Render** (free tie
 
 ```bash
 # Clone the repo
-git clone https://github.com/<your-username>/Indianpost-Parcel-Tracker.git
+git clone https://github.com/creep-xeditz/Indianpost-Parcel-Tracker.git
 cd Indianpost-Parcel-Tracker
 
 # Create virtual environment
