@@ -53,7 +53,7 @@ Built with **Supabase** (PostgreSQL + Storage), deployed on **Render** (free tie
 
 ---
 
-### 2. Local Development
+### 2. Local Development (Use CMD)
 
 ```bash
 # Clone the repo
@@ -71,7 +71,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Create .env from template
-cp .env.example .env
+copy .env.example .env
 # Edit .env with your Supabase credentials (see below)
 
 # Run locally
